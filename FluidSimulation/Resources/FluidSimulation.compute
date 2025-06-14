@@ -1,0 +1,315 @@
+#pragma kernel BuildGrid
+#pragma kernel FindNeighbors
+#pragma kernel ComputeDensity
+#pragma kernel ComputePressure
+#pragma kernel ComputeForces
+#pragma kernel Integrate
+
+struct Particle
+{
+    float3 position;
+    float3 velocity;
+    float3 acceleration;
+    float life;
+};
+
+RWStructuredBuffer<Particle> particles;
+RWStructuredBuffer<float> densities;
+RWStructuredBuffer<float> pressures;
+RWStructuredBuffer<float4> forces;
+RWStructuredBuffer<int> neighbors;
+RWStructuredBuffer<int> neighborCounts;
+RWStructuredBuffer<int> grid;
+RWStructuredBuffer<int> gridCounts;
+
+int maxParticles;
+int activeParticles;
+float particleRadius;
+float smoothingRadius;
+float particleMass;
+float restDensity;
+float viscosity;
+float stiffness;
+float damping;
+float deltaTime;
+float3 gravity;
+float3 containerSize;
+float3 containerCenter;
+int gridSize;
+float gridCellSize;
+int clearGrid;
+
+static const int MAX_NEIGHBORS = 64;
+static const int MAX_PARTICLES_PER_CELL = 10;
+static const float PI = 3.14159265f;
+
+float Poly6Kernel(float distSq, float h)
+{
+    if (distSq >= h * h) return 0.0f;
+    float diff = h * h - distSq;
+    float h9 = h * h * h * h * h * h * h * h * h; // h^9 без использования pow
+    return 315.0f / (64.0f * PI * h9) * diff * diff * diff;
+}
+
+float3 SpikyKernelGradient(float3 r, float h)
+{
+    float dist = length(r);
+    if (dist >= h || dist == 0) return float3(0, 0, 0);
+    float diff = h - dist;
+    float h6 = h * h * h * h * h * h; // h^6 без использования pow
+    return -45.0f / (PI * h6) * diff * diff * (r / dist);
+}
+
+float ViscosityKernel(float dist, float h)
+{
+    if (dist >= h) return 0.0f;
+    float h6 = h * h * h * h * h * h; // h^6 без использования pow
+    return 45.0f / (PI * h6) * (h - dist);
+}
+
+int3 GetGridPosition(float3 pos)
+{
+    float3 relativePos = pos - containerCenter + containerSize * 0.5f;
+    int3 gridPos = (int3)(relativePos / gridCellSize);
+    gridPos = clamp(gridPos, int3(0, 0, 0), int3(gridSize - 1, gridSize - 1, gridSize - 1));
+    return gridPos;
+}
+
+int GetGridIndex(int3 gridPos)
+{
+    return gridPos.x + gridPos.y * gridSize + gridPos.z * gridSize * gridSize;
+}
+
+[numthreads(64, 1, 1)]
+void BuildGrid(uint3 id : SV_DispatchThreadID)
+{
+    int index = (int)id.x; // Приведение к int для консистентности
+    
+    if (clearGrid == 1)
+    {
+        if (index < gridSize * gridSize * gridSize)
+        {
+            gridCounts[index] = 0;
+        }
+        return;
+    }
+    
+    if (index >= activeParticles) return;
+    
+    if (particles[index].life <= 0) return;
+    
+    int3 gridPos = GetGridPosition(particles[index].position);
+    int gridIndex = GetGridIndex(gridPos);
+    
+    int originalCount;
+    InterlockedAdd(gridCounts[gridIndex], 1, originalCount);
+    
+    if (originalCount < MAX_PARTICLES_PER_CELL)
+    {
+        grid[gridIndex * MAX_PARTICLES_PER_CELL + originalCount] = index;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void FindNeighbors(uint3 id : SV_DispatchThreadID)
+{
+    int index = (int)id.x; // Приведение к int для консистентности
+    if (index >= activeParticles) return;
+    
+    if (particles[index].life <= 0) return;
+    
+    int neighborCount = 0;
+    float3 pos = particles[index].position;
+    int3 gridPos = GetGridPosition(pos);
+    
+    for (int x = -1; x <= 1; x++)
+    {
+        for (int y = -1; y <= 1; y++)
+        {
+            for (int z = -1; z <= 1; z++)
+            {
+                int3 neighborGridPos = gridPos + int3(x, y, z);
+                
+                if (any(neighborGridPos < 0) || any(neighborGridPos >= gridSize))
+                    continue;
+                
+                int neighborGridIndex = GetGridIndex(neighborGridPos);
+                int cellParticleCount = gridCounts[neighborGridIndex];
+                
+                for (int i = 0; i < min(cellParticleCount, MAX_PARTICLES_PER_CELL); i++)
+                {
+                    int neighborIndex = grid[neighborGridIndex * MAX_PARTICLES_PER_CELL + i];
+                    
+                    if (neighborIndex == index || neighborIndex >= activeParticles) continue;
+                    if (particles[neighborIndex].life <= 0) continue;
+                    
+                    float3 diff = particles[neighborIndex].position - pos;
+                    float distSq = dot(diff, diff);
+                    
+                    if (distSq < smoothingRadius * smoothingRadius && neighborCount < MAX_NEIGHBORS)
+                    {
+                        neighbors[index * MAX_NEIGHBORS + neighborCount] = neighborIndex;
+                        neighborCount++;
+                    }
+                }
+            }
+        }
+    }
+    
+    neighborCounts[index] = neighborCount;
+}
+
+[numthreads(64, 1, 1)]
+void ComputeDensity(uint3 id : SV_DispatchThreadID)
+{
+    int index = (int)id.x; // Приведение к int для консистентности
+    if (index >= activeParticles) return;
+    
+    if (particles[index].life <= 0)
+    {
+        densities[index] = 0;
+        return;
+    }
+    
+    float density = 0;
+    float3 pos = particles[index].position;
+    
+    density += particleMass * Poly6Kernel(0, smoothingRadius);
+    
+    int neighborCount = neighborCounts[index];
+    for (int i = 0; i < neighborCount; i++)
+    {
+        int neighborIndex = neighbors[index * MAX_NEIGHBORS + i];
+        float3 diff = particles[neighborIndex].position - pos;
+        float distSq = dot(diff, diff);
+        density += particleMass * Poly6Kernel(distSq, smoothingRadius);
+    }
+    
+    densities[index] = density;
+}
+
+[numthreads(64, 1, 1)]
+void ComputePressure(uint3 id : SV_DispatchThreadID)
+{
+    int index = (int)id.x; // Приведение к int для консистентности
+    if (index >= activeParticles) return;
+    
+    if (particles[index].life <= 0)
+    {
+        pressures[index] = 0;
+        return;
+    }
+    
+    float density = densities[index];
+    pressures[index] = stiffness * (density - restDensity);
+}
+
+[numthreads(64, 1, 1)]
+void ComputeForces(uint3 id : SV_DispatchThreadID)
+{
+    int index = (int)id.x; // Приведение к int для консистентности
+    if (index >= activeParticles) return;
+    
+    if (particles[index].life <= 0)
+    {
+        forces[index] = float4(0, 0, 0, 0);
+        return;
+    }
+    
+    float3 pressureForce = float3(0, 0, 0);
+    float3 viscosityForce = float3(0, 0, 0);
+    
+    float3 pos = particles[index].position;
+    float3 vel = particles[index].velocity;
+    float density = densities[index];
+    float pressure = pressures[index];
+    
+    int neighborCount = neighborCounts[index];
+    for (int i = 0; i < neighborCount; i++)
+    {
+        int neighborIndex = neighbors[index * MAX_NEIGHBORS + i];
+        
+        float3 neighborPos = particles[neighborIndex].position;
+        float3 neighborVel = particles[neighborIndex].velocity;
+        float neighborDensity = densities[neighborIndex];
+        float neighborPressure = pressures[neighborIndex];
+        
+        float3 diff = pos - neighborPos;
+        float dist = length(diff);
+        
+        if (dist > 0)
+        {
+            float3 direction = diff / dist;
+            
+            float avgPressure = (pressure + neighborPressure) * 0.5f;
+            float3 pressureGradient = SpikyKernelGradient(diff, smoothingRadius);
+            pressureForce -= particleMass * avgPressure / neighborDensity * pressureGradient;
+            
+            float3 velocityDiff = neighborVel - vel;
+            float viscosityKernel = ViscosityKernel(dist, smoothingRadius);
+            viscosityForce += viscosity * particleMass * velocityDiff / neighborDensity * viscosityKernel;
+        }
+    }
+    
+    float3 totalForce = pressureForce + viscosityForce + gravity * density;
+    forces[index] = float4(totalForce, 0);
+}
+
+[numthreads(64, 1, 1)]
+void Integrate(uint3 id : SV_DispatchThreadID)
+{
+    int index = (int)id.x; // Приведение к int для консистентности
+    if (index >= activeParticles) return;
+    
+    if (particles[index].life <= 0) return;
+    
+    float3 force = forces[index].xyz;
+    float density = max(densities[index], 0.001f);
+    
+    particles[index].acceleration = force / density;
+    particles[index].velocity += particles[index].acceleration * deltaTime;
+    particles[index].position += particles[index].velocity * deltaTime;
+    
+    float3 pos = particles[index].position;
+    float3 vel = particles[index].velocity;
+    float3 containerMin = containerCenter - containerSize * 0.5f;
+    float3 containerMax = containerCenter + containerSize * 0.5f;
+    
+    if (pos.x < containerMin.x + particleRadius)
+    {
+        pos.x = containerMin.x + particleRadius;
+        vel.x = abs(vel.x) * damping;
+    }
+    else if (pos.x > containerMax.x - particleRadius)
+    {
+        pos.x = containerMax.x - particleRadius;
+        vel.x = -abs(vel.x) * damping;
+    }
+    
+    if (pos.y < containerMin.y + particleRadius)
+    {
+        pos.y = containerMin.y + particleRadius;
+        vel.y = abs(vel.y) * damping;
+    }
+    else if (pos.y > containerMax.y - particleRadius)
+    {
+        pos.y = containerMax.y - particleRadius;
+        vel.y = -abs(vel.y) * damping;
+    }
+    
+    if (pos.z < containerMin.z + particleRadius)
+    {
+        pos.z = containerMin.z + particleRadius;
+        vel.z = abs(vel.z) * damping;
+    }
+    else if (pos.z > containerMax.z - particleRadius)
+    {
+        pos.z = containerMax.z - particleRadius;
+        vel.z = -abs(vel.z) * damping;
+    }
+    
+    particles[index].position = pos;
+    particles[index].velocity = vel;
+    
+    particles[index].life = max(0, particles[index].life - deltaTime * 0.01f);
+}
